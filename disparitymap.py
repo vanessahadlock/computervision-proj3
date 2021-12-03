@@ -364,11 +364,16 @@ def main():
     F_cones, cones_src_pts, cones_dst_pts = FundMatrix(correspondences1)
     F_building, building_src_pts, building_dst_pts = FundMatrix(correspondences2)
 
-    # cones = findEpipoleLines(cones_left, cones_right, cones_src_pts, cones_dst_pts, F_cones)
-    # cv2.imwrite("linescones.jpg", cones)
+
+    ###################################################
+    ### Draw Epipolar Lines for the inlier features ###
+    ###################################################
+
+    cones = findEpipoleLines(cones_left, cones_right, cones_src_pts, cones_dst_pts, F_cones)
+    cv2.imwrite("linescones.jpg", cones)
     
-    # building = findEpipoleLines(castle_left, castle_right, building_src_pts, building_dst_pts, F_building)
-    # cv2.imwrite("linesbuildings.jpg", building)
+    building = findEpipoleLines(castle_left, castle_right, building_src_pts, building_dst_pts, F_building)
+    cv2.imwrite("linesbuildings.jpg", building)
 
     disparity_map = imageRectification(cones_left, cones_right, cones_src_pts, cones_dst_pts, F_cones)
     cv2.imwrite("disparitymap.jpg", disparity_map)
