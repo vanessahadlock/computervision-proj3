@@ -1,6 +1,11 @@
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
+import math
+from numpy.core.numeric import empty_like
+from scipy.interpolate import interp1d
+
+############### 1 ###############
 
 # use cv2.cornerHarris, threshold by 10%, cv2.cornerSubPix
 def cvCorners(img):
@@ -34,7 +39,6 @@ def cvCorners(img):
 
     return ret
 
-
 # Computes the Normalized Cross Corellation of two 2D arrays
 def NCC(f, g):
 
@@ -53,21 +57,6 @@ def NCCColor(f, g):
     for i in range(3):
         nccBand.append(NCC(f[:,:,i],g[:,:,i]))
     return np.average(nccBand)
-
-# Layers the corners on top of the orignial image in red
-def addCornertoImage(img, cornerImg, outfilename):
-
-    h, w, _ = img.shape
-    for y in range(h):
-        for x in range(w):
-
-            if cornerImg[y,x] != 0:
-                img[y,x] = [0,0,255]
-
-    cv2.imwrite(outfilename, img)
-    
-    return
-
 
 # Returns a list of elements [x1,y1,x2,y2] where (x1,y1) in img1 corresponds to (x2,y2) in img2
 def findCorrespondences(img1, img2, corners_img1, corners_img2, wsize, threshold):
@@ -115,15 +104,14 @@ def findCorrespondences(img1, img2, corners_img1, corners_img2, wsize, threshold
             if(ncc > nccMax):
                 nccMax = ncc
                 nccMax_idx = i
-    
+
         if nccMax > threshold:
             pt2: np.ndarray = corners2[nccMax_idx]
             ret.append(coord1[::-1] + pt2[::-1])
 
     return ret
 
-
-# Draws the corresponding features of two images
+# Draws lines between the corresponding features of two images
 def drawMatches(img1, img2, correspondences):
 
     ###  get the 3x3 transformation homography ###
@@ -168,20 +156,21 @@ def drawMatches(img1, img2, correspondences):
 
     return matches_img, kp1_inliers, kp2_inliers
 
+############### 2 ###############
+
 # find the fundamental matrix for the given correspondences
 def FundMatrix(correspondences):
 
-    ###  get the 3x3 transformation homography ###
     dst_pts = []
     src_pts = []
 
     for row in correspondences:
 
-            pt1 = [row[0], row[1]]
-            pt2 = [row[2], row[3]]
+        pt1 = [row[0], row[1]]
+        pt2 = [row[2], row[3]]
 
-            src_pts.append(pt1)
-            dst_pts.append(pt2)
+        src_pts.append(pt1)
+        dst_pts.append(pt2)
     
     dst_pts = np.int32(dst_pts)
     src_pts = np.int32(src_pts)
@@ -196,112 +185,169 @@ def FundMatrix(correspondences):
 
     return F, src_pts, dst_pts
 
+# draw epilines on an image
+def drawEpiLines(img, lines, pts):
 
+    ret = np.ndarray.copy(img)
+
+    _, h, _ = img.shape
+
+    for e, pt in zip(lines, pts):
+
+        color = tuple(np.random.randint(0,255,3).tolist())
+        
+        # calculate epipolar line
+        x0, y0 = map(int, [0, -e[2] / e[1]]) #x=0, y=-c/b
+        x1, y1 = map(int, [h, -(e[2] + e[0]*h) / e[1]]) #x=h, y=-(c+ah)/b
+
+        ret = cv2.line(ret, (x0, y0), (x1, y1), color, 1)
+        ret = cv2.circle(ret, tuple(pt), 5, color, -1)
+
+    return ret
+
+def epiLines(img1, img2, pts1, pts2, F):
+
+    # Find lines for image1 using img2 points
+    img1_lines = cv2.computeCorrespondEpilines(pts2, 2, F)
+    img1_lines = img1_lines.reshape(-1,3)
+
+    # Find lines for image 2 using img1 points
+    img2_lines = cv2.computeCorrespondEpilines(pts1, 1, F)
+    img2_lines = img2_lines.reshape(-1,3)
+
+    epi_left = drawEpiLines(img1, img1_lines, pts1)
+    epi_right = drawEpiLines(img2, img2_lines, pts2)
+
+    return epi_left, epi_right
+    return np.concatenate((epi_left, epi_right), axis=1)
+
+############### 3 ###############
+
+# Warp an image given a homography so that it it fully contained in the output img
+def perspective_warp(image: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    
+    h, w = image.shape[:2]
+    corners_bef = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
+    corners_aft = cv2.perspectiveTransform(corners_bef, transform)
+    xmin = math.floor(corners_aft[:, 0, 0].min())
+    ymin = math.floor(corners_aft[:, 0, 1].min())
+    xmax = math.ceil(corners_aft[:, 0, 0].max())
+    ymax = math.ceil(corners_aft[:, 0, 1].max())
+    x_adj = math.floor(xmin - corners_aft[0, 0, 0])
+    y_adj = math.floor(ymin - corners_aft[0, 0, 1])
+    translate = np.eye(3)
+    translate[0, 2] = -xmin
+    translate[1, 2] = -ymin
+    corrected_transform = np.matmul(translate, transform)
+    return cv2.warpPerspective(image, corrected_transform, (math.ceil(xmax - xmin), math.ceil(ymax - ymin)))
+
+# Reshape the images so that the epipolar lines are horizontal
 def imageRectification(img_left, img_right, pts1, pts2, F):
     
     h1, w1, _ = img_left.shape
     h2, w2, _ = img_right.shape
 
-    [H1, H2, success] = cv2.stereoRectifyUncalibrated(np.float64(pts1), np.float64(pts2), F, imgSize=(w1, h1))
+    # [_, H1, H2] = cv2.stereoRectifyUncalibrated(np.float64(pts1), np.float64(pts2), F, imgSize=(w1, h1))
+    [_, H1, H2] = cv2.stereoRectifyUncalibrated(pts1, pts2, F, imgSize=(w1, h1))
 
-    print(img_left.shape)
-    print(h1, w1)
+    rectified_l = perspective_warp(img_left, H1)
+    rectified_r = perspective_warp(img_right, H2)
+    
+    return rectified_l, rectified_r
 
-    ############## Undistort (Rectify) ##############
-    imgL_undistorted = cv2.warpPerspective(img_left, H1, (375, 450))
-    imgR_undistorted = cv2.warpPerspective(img_right, H2, (w2, h2))
-    cv2.imwrite("undistorted_Left.png", imgL_undistorted)
-    cv2.imwrite("undistorted_Right.png", imgR_undistorted)
+# return epiilne_img and matches_img given two rectified images
+def epilinesRectified(rectified_left, rectified_right):
 
-    ############## Calculate Disparity (Depth Map) ##############
+    # corners
+    corners_left = cvCorners(rectified_left)
+    corners_right = cvCorners(rectified_right)
+    
+    # correspondcnes
+    print("Finding correspondences...")
+    correspondences1 = findCorrespondences(rectified_left, rectified_right, corners_left, corners_right, 7, 0)
 
-    # Using StereoBM
-    stereo = cv2.StereoBM_create(numDisparities=16, blockSize=15)
-    disparity_BM = stereo.compute(imgL_undistorted, imgR_undistorted)
-    plt.imshow(disparity_BM, "gray")
-    plt.colorbar()
-    plt.show()
+    #matches
+    matches_img, _, _ = drawMatches(rectified_left, rectified_right, correspondences1)
 
+    # F mat
+    F_rect, rect_src, rect_dst = FundMatrix(correspondences1)
+
+    print(f'F_rect: \n\n{F_rect}\n')
+
+    # epilines
+    epiline_l, epiline_r = epiLines(rectified_left, rectified_right, rect_src, rect_dst, F_rect)
+
+    return epiline_l, epiline_r, matches_img
+
+# Create disparity images using cv2.StereoBM
+def cv_disparity(img_left, img_right, pts1, pts2, F):
+    
+    h1, w1, _ = img_left.shape
+    [_, H1, H2] = cv2.stereoRectifyUncalibrated(np.float64(pts1), np.float64(pts2), F, imgSize=(w1, h1))
+    imgL_undistorted = cv2.warpPerspective(img_left, H1, (w1,h1))
+    imgR_undistorted = cv2.warpPerspective(img_right, H2, (w1,h1))
+
+    stereo = cv2.StereoBM_create(numDisparities = 32, blockSize = 15)
+    disparity_BM = stereo.compute(cv2.cvtColor(imgL_undistorted, cv2.COLOR_BGR2GRAY), cv2.cvtColor(imgR_undistorted, cv2.COLOR_BGR2GRAY))
     return disparity_BM
 
+# asume correspondences are on the same rows
+def disparitymap_rectified1(rectified_left, rectified_right, wNcc, xrange):
 
-def findEpipoleLines(img1, img2, pts1, pts2, F):
+    corners_left = cvCorners(rectified_left)
+    corners_right = cvCorners(rectified_right)
+    correspondences = findCorrespondences(rectified_left, rectified_right, corners_left, corners_right, 7, 0)
+    F_rect, rect_src, rect_dst = FundMatrix(correspondences)
 
-    # Find epilines corresponding to points in right image (second image) and
-    # drawing its lines on left image
+    if wNcc % 2 == 0:
+        wNcc += 1
+    offset = wNcc // 2
+
+    disparity_img = np.zeros_like(rectified_left)
     
-    lines1 = cv2.computeCorrespondEpilines(pts1, 2, F)
+    h1, w1, _ = rectified_left.shape
+    h2, w2, _ = rectified_right.shape
 
-    lines1 = lines1.reshape(-1,3)
-    img5, img6 = drawlines(img1, img2, lines1, pts1, pts2)
-    
-    # Find epilines corresponding to points in left image (first image) and
-    # drawing its lines on right image
-    lines2 = cv2.computeCorrespondEpilines(pts2, 1, F)
-    lines2 = lines2.reshape(-1,3)
-    img3, img4 = drawlines(img2, img1, lines2, pts2, pts1)
+    # For every pixel in left image:
+    for y1 in range(offset, h1 - offset):
+        y2 = y1
+        print(int(100*y1/h1))
 
-    plt.subplot(121),plt.imshow(img5)
-    plt.subplot(122),plt.imshow(img3)
-    plt.show()
+        for x1 in range(offset, w1 - offset):
 
-    lines = np.concatenate((img3, img5), axis=1)
+            # get window of left pixel
+            win1 = rectified_left[y1 - offset : y1 + offset + 1, x1 - offset : x1 + offset + 1, :]
 
-    return lines
-    
-   
-def drawlines(img1, img2, lines, pts1, pts2):
-   # img1 - image on which we draw the epilines for the points in img2 lines
-   # corresponding epilines
+            if (y2 > offset) & (y2 < h2):
 
-    w, h, _ = img1.shape
+                bottom = x1 - xrange
+                if (bottom < offset):
+                    bottom = offset
+                top = x1 + xrange
+                if (top > (w2 - offset)):
+                    top = w2 - offset
 
-    for w, pt1, pt2 in zip(lines, pts1, pts2):
-        color = tuple(np.random.randint(0,255,3).tolist())
-        x0, y0 = map(int, [0, -w[2]/w[1] ])
-        x1, y1 = map(int, [h, -(w[2]+w[0]*h)/w[1] ])
-        img1 = cv2.line(img1, (x0, y0), (x1, y1), color, 1)
-        img1 = cv2.circle(img1, tuple(pt1), 5, color, -1)
-        img2 = cv2.circle(img2, tuple(pt2), 5, color, -1)
-    
-    return img1, img2
+                # Iterate row and find the x value of highest corresponding point
+                nccMax = 0
+                corr_x = 0
+                for x2 in range(bottom, top):
+
+                    win2 = rectified_right[y2 - offset : y2 + offset + 1, x2 - offset : x2 + offset + 1, :]
+
+                    ncc = NCCColor(win1, win2)
+                    if(ncc > nccMax):
+                        nccMax = ncc
+                        corr_x = x2
+
+                # Map point disparity to ret image
+                if (nccMax > .9):
+                    m = interp1d([0,xrange],[0,255])
+                    disparity_img[y1, x1] = m(abs(x1 - corr_x))
+            
+    return disparity_img
 
 
-def disparitymap(img_left, img_right, pts1, pts2, F, d_max):
-
-    # makes corresponding points from (x1, y1) and (x2, y2) into (x1, x2, y1, y2) in each row
-    points = np.dstack((pts1, pts2))
-
-    print(pts1[0])
-    print(pts2[0])
-
-    print(points[0])
-    
-    disparity_x = []
-    disparity_y = []
-
-    w, h, _ = img_left.shape
-    
-    disparity_map = np.zeros((w, h, 1), dtype=np.uint8)
-
-    for row in points:
-
-            x1 = row[0][0]
-            x2 = row[0][1]
-
-            y1 = row[1][0]
-            y2 = row[1][1]
-
-            disparityX = abs(x2 - x1)
-            disparityY = abs(y2 - y1)
-
-            disparity_x.append(disparityX)
-            disparity_y.append(disparityY)
-
-            # disparity_map[x] = disparityX * (255. / d_max)
-
-    return
-
+### MAIN ###
 def main():
 
     img1 = "cones_left"
@@ -314,82 +360,127 @@ def main():
     castle_left: np.ndarray = cv2.imread(f'images/{img3}.jpg')
     castle_right: np.ndarray = cv2.imread(f'images/{img4}.jpg')
 
-
     ##################################################
     ### Detect corner pixels using Harris with NMS ###
     ##################################################
 
-    print('Finding corners for cones_left...')
-    corners_cones_left = cvCorners(cones_left)
+    # print('Finding corners for cones_left...')
+    # corners_cones_left = cvCorners(cones_left)
     
-    print('Finding corners for cones_right...')
-    corners_cones_right = cvCorners(cones_right)
+    # print('Finding corners for cones_right...')
+    # corners_cones_right = cvCorners(cones_right)
     
-    print('Finding corners for building_left...')
-    corners_building_left = cvCorners(castle_left)    
+    # print('Finding corners for building_left...')
+    # corners_building_left = cvCorners(castle_left)    
 
-    print('Finding corners for building_right...')
-    corners_building_right = cvCorners(castle_right)
+    # print('Finding corners for building_right...')
+    # corners_building_right = cvCorners(castle_right)
 
-    ##################################################
-    ############## Find correspondences ##############
-    ##################################################
+    # # ##################################################
+    # # ##### Find correspondences  / Draw Matches #######
+    # # ##################################################
 
-    wNcc = 7
-    thres = 0
-    d_max = 255
+    # wNcc = 7
+    # thres = 0
+    # d_max = 255
 
-    print("Finding correspondences for set 1...")
-    correspondences1 = findCorrespondences(cones_left, cones_right, corners_cones_left, corners_cones_right, wNcc, thres)
+    # print("Finding correspondences for set 1...")
+    # correspondences1 = findCorrespondences(cones_left, cones_right, corners_cones_left, corners_cones_right, wNcc, thres)
+    # cone_matches, _, _ = drawMatches(cones_left, cones_right, correspondences1)
+    # cv2.imwrite("corr/cones.png", cone_matches)
 
-    print("Finding correspondences for set 2...")
-    correspondences2 = findCorrespondences(castle_left, castle_right, corners_building_left, corners_building_right, wNcc, thres)
+    # print("Finding correspondences for set 2...")
+    # correspondences2 = findCorrespondences(castle_left, castle_right, corners_building_left, corners_building_right, wNcc, thres)
+    # castle_matches, _, _ = drawMatches(castle_left, castle_right, correspondences2)
+    # cv2.imwrite("corr/castle.png", castle_matches)
 
-    ##################################################
-    ################## Draw Matches ##################
-    ##################################################
+    # ###################################################
+    # #### Find the Fundamental Matrix using RANSAC #####
+    # ###################################################
 
-    print("Drawing matches for set 1...")
-    cone_matches, cone_kp1, cone_kp2 = drawMatches(cones_left, cones_right, correspondences1)
-    cv2.imwrite("matchescones.jpg", cone_matches)
+    # F_cones, cones_src_pts, cones_dst_pts = FundMatrix(correspondences1)
+    # F_castle, castle_src_pts, castle_dst_pts = FundMatrix(correspondences2)
 
-    print("Drawing matches for set 2...")
-    building_matches, building_kp1, building_kp2 = drawMatches(castle_left, castle_right, correspondences2)
-    cv2.imwrite("matchesbuildings.jpg", building_matches)
+    # np.save('Fmat/F_cones_double.npy', F_cones)
+    # np.save('Fmat/cones_src.npy', cones_src_pts)
+    # np.save('Fmat/cones_dst.npy', cones_dst_pts)
 
-    ###################################################
-    #### Find the Fundamental Matrix using RANSAC #####
-    ###################################################
+    # np.save('Fmat/F_castle_double.npy', F_castle)
+    # np.save('Fmat/castle_src.npy', castle_src_pts)
+    # np.save('Fmat/castle_dst.npy', castle_dst_pts)
+    
+    # return
 
-    F_cones, cones_src_pts, cones_dst_pts = FundMatrix(correspondences1)
-    F_building, building_src_pts, building_dst_pts = FundMatrix(correspondences2)
+    F_cones = np.load('Fmat/F_cones_double.npy')
+    cones_src_pts = np.load('Fmat/cones_src.npy')
+    cones_dst_pts = np.load('Fmat/cones_dst.npy')
 
+    F_castle = np.load('Fmat/F_castle_double.npy')
+    castle_src_pts = np.load('Fmat/castle_src.npy')
+    castle_dst_pts = np.load('Fmat/castle_dst.npy')
+
+    # print(f'F_cones1: \n\n{F_cones}\n')
+    # print(f'F_castle1: \n\n{F_castle}\n')
 
     ###################################################
     ### Draw Epipolar Lines for the inlier features ###
     ###################################################
 
-    cones = findEpipoleLines(cones_left, cones_right, cones_src_pts, cones_dst_pts, F_cones)
-    cv2.imwrite("linescones.jpg", cones)
+    # cones_epiline_img_l, cones_epiline_img_r = epiLines(cones_left, cones_right, cones_src_pts, cones_dst_pts, F_cones)
+    # cv2.imwrite("epilines/cones_l.jpg", cones_epiline_img_l)
+    # cv2.imwrite("epilines/cones_r.jpg", cones_epiline_img_r)
     
-    building = findEpipoleLines(castle_left, castle_right, building_src_pts, building_dst_pts, F_building)
-    cv2.imwrite("linesbuildings.jpg", building)
+    # castle_epiline_img_l, castle_epiline_img_r = epiLines(castle_left, castle_right, castle_src_pts, castle_dst_pts, F_castle)
+    # cv2.imwrite("epilines/castle_l.jpg", castle_epiline_img_l)
+    # cv2.imwrite("epilines/castle_r.jpg", castle_epiline_img_r)
 
-    disparity_map = imageRectification(cones_left, cones_right, cones_src_pts, cones_dst_pts, F_cones)
-    cv2.imwrite("disparitymap.jpg", disparity_map)
-
-    # disparitymap(cones_left, cones_right, cones_src_pts, cones_dst_pts, F_cones, d_max)
-
+    ###################################################
+    ############# Rectify Images using F ##############
+    ###################################################
 
 
-    ##### To Calculate The Disparity Map #####
+    cones_left_rect, cones_right_rect = imageRectification(cones_left, cones_right, cones_src_pts, cones_dst_pts, F_cones)
+    
+    # epiline_img_l, epiline_img_r, matches_img = epilinesRectified(cones_left_rect, cones_right_rect)
+    # cv2.imwrite("rectified/cones_epiline_l.png", epiline_img_l)
+    # cv2.imwrite("rectified/cones_epiline_r.png", epiline_img_r)
+
+    castle_left_rect, castle_right_rect = imageRectification(castle_left, castle_right, castle_src_pts, castle_dst_pts, F_castle)
+    
+    # epiline_img_l, epiline_img_r, matches_img = epilinesRectified(castle_left_rect, castle_right_rect)
+    # cv2.imwrite("rectified/castle_epiline_l.png", epiline_img_l)
+    # cv2.imwrite("rectified/castle_epiline_r.png", epiline_img_r)
+
+    ###################################################
+    ########### Compute Dense Disparity Map ###########
+    ###################################################
+
+    s = 0.5
+    wNcc = 7
+    xrange = 50
+
+    h, w, _ = castle_right.shape
+    rectifiedImg1 = cv2.resize(castle_left_rect, (int(h*s), int(w*s)))
+    rectifiedImg2 = cv2.resize(castle_right_rect, (int(h*s), int(w*s)))
+
+    disparityimg = disparitymap_rectified1(rectifiedImg1, rectifiedImg2, wNcc, xrange)
+    cv2.imwrite("disparity/castle_70_res_wNcc7_xrange50.png", disparityimg)
+
+    return
+
+    rectifiedImg1, rectifiedImg2 = imageRectification(castle_left, castle_right, building_src_pts, building_dst_pts, F_building)
+    cv2.imwrite("castle_rectified_left.png", rectifiedImg1)
+    cv2.imwrite("castle_rectified_right.png", rectifiedImg2)
+
+    disparityimg = disparitymap(castle_left, castle_right, building_src_pts, building_dst_pts, F_building, d_max)
+    # cv2.imwrite("disparuty_img2.png", disparityimg)
+
     # Rectify the two images so their epipolar lines will all be parallel
     # In the left image, at the first pixel use the F matrix to calculate an epipolar line
     # at that point to the other image. Then search along the epipolar line for the highest
     # corresponding point using NCCcolor() and then calculate the disparity to that point
     # in order to get the disparity at the first pixel. Iterate through each pixel in the 
     # left image and repeat this process till you get a disparity value for each pixel 
-
 
 
 if __name__ == "__main__":
